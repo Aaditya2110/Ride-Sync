@@ -1,0 +1,324 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <WiFiClient.h>
+#include <ThingSpeak.h> // Include the ThingSpeak library
+
+// Replace with your network credentials
+const char* ssid = "Anunay";
+const char* password = "goldenboot";
+
+// ThingSpeak setup
+unsigned long myChannelNumber = 2742447; // Replace with your ThingSpeak channel number
+const char* myWriteAPIKey = "CGUNCPQJQT9J9MI2"; // Replace with your ThingSpeak Write API Key
+
+// ESP8266 web server on port 80
+ESP8266WebServer server(80);
+
+// Pin definitions
+#define BUZZER_PIN D6
+#define RELAY_PIN D7
+
+// MPU6050 setup
+Adafruit_MPU6050 mpu;
+float tilt = 0.0;
+const float TILT_THRESHOLD = 30.0; // Tilt threshold in degrees
+
+// State of buzzer and relay
+bool buzzerStatus = LOW;
+bool relayStatus = LOW;
+
+WiFiClient client; // Declare WiFiClient object
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize I2C for MPU6050
+  Wire.begin(D2, D1);
+
+  // Initialize MPU6050
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip");
+    while (1) delay(10);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
+
+  // Initialize buzzer and relay
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+
+  Serial.println("Connected to WiFi");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Initialize ThingSpeak with the created client
+  ThingSpeak.begin(client); // Pass the client object here
+
+  // Set up web server routes
+  server.on("/", handle_OnConnect);
+  server.on("/buzzeron", handle_BuzzerOn);
+  server.on("/buzzeroff", handle_BuzzerOff);
+  server.on("/relayon", handle_RelayOn);
+  server.on("/relayoff", handle_RelayOff);
+  server.on("/tiltValue", handle_TiltValue);
+  server.on("/location", handle_Location);
+  server.onNotFound(handle_NotFound);
+
+  // Start the web server
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+
+void loop() {
+  // Get tilt angle
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  tilt = atan2(a.acceleration.y, a.acceleration.x) * 180 / PI;
+
+  // Handle tilt threshold and control buzzer/relay
+  if (abs(tilt) > TILT_THRESHOLD) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    digitalWrite(RELAY_PIN, HIGH);
+    buzzerStatus = HIGH;
+    relayStatus = HIGH;
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(RELAY_PIN, LOW);
+    buzzerStatus = LOW;
+    relayStatus = LOW;
+  }
+
+  // Send data to ThingSpeak
+  ThingSpeak.setField(1, tilt);            // Send tilt value to field 1 (TiltStatus)
+  ThingSpeak.setField(2, buzzerStatus);    
+  ThingSpeak.writeFields(myChannelNumber, myWriteAPIKey);
+  server.handleClient();
+}
+
+
+// Web server handlers (unchanged)
+void handle_OnConnect() {
+  server.send(200, "text/html", SendHTML(buzzerStatus, relayStatus, tilt));
+}
+
+void handle_BuzzerOn() {
+  buzzerStatus = HIGH;
+  digitalWrite(BUZZER_PIN, HIGH);
+  server.send(200, "text/html", SendHTML(buzzerStatus, relayStatus, tilt));
+}
+
+void handle_BuzzerOff() {
+  buzzerStatus = LOW;
+  digitalWrite(BUZZER_PIN, LOW);
+  server.send(200, "text/html", SendHTML(buzzerStatus, relayStatus, tilt));
+}
+
+void handle_RelayOn() {
+  relayStatus = HIGH;
+  digitalWrite(RELAY_PIN, HIGH);
+  server.send(200, "text/html", SendHTML(buzzerStatus, relayStatus, tilt));
+}
+
+void handle_RelayOff() {
+  relayStatus = LOW;
+  digitalWrite(RELAY_PIN, LOW);
+  server.send(200, "text/html", SendHTML(buzzerStatus, relayStatus, tilt));
+}
+
+void handle_TiltValue() {
+  server.send(200, "text/plain", String(tilt)); // Send tilt value as plain text
+}
+
+void handle_Location() {
+  WiFiClient client;
+  Serial.println("Attempting to connect to API...");
+
+  if (client.connect("ip-api.com", 80)) {
+    Serial.println("Connected to API!");
+
+    // Send HTTP GET request
+    client.print("GET /json/ HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
+    
+    // Wait longer for the response
+    delay(1000);
+
+    // Read the entire response
+    String response = "";
+    while (client.available()) {
+      response += client.readString();
+    }
+    client.stop();
+
+    // Extract details from the JSON response
+    String status = extractValue(response, "\"status\":\"", "\"");
+    if (status != "success") {
+      server.send(500, "text/plain", "Failed to fetch location data");
+      Serial.println("Failed to fetch location data");
+      return;
+    }
+
+    String country = extractValue(response, "\"country\":\"", "\"");
+    String region = extractValue(response, "\"regionName\":\"", "\"");
+    String city = extractValue(response, "\"city\":\"", "\"");
+    String isp = extractValue(response, "\"isp\":\"", "\"");
+    String timezone = extractValue(response, "\"timezone\":\"", "\"");
+    float latitude = extractValue(response, "\"lat\":", ",").toFloat();
+    float longitude = extractValue(response, "\"lon\":", ",").toFloat();
+
+    // Print extracted values for debugging
+    Serial.println("Extracted Values:");
+    Serial.println("Country: " + country);
+    Serial.println("Region: " + region);
+    Serial.println("City: " + city);
+    Serial.println("ISP: " + isp);
+    Serial.println("Timezone: " + timezone);
+    Serial.println("Latitude: " + String(latitude));
+    Serial.println("Longitude: " + String(longitude));
+
+    // Create JSON response with extracted details
+    String jsonResponse = "{";
+    jsonResponse += "\"status\":\"" + status + "\",";  
+    jsonResponse += "\"country\":\"" + country + "\","; 
+    jsonResponse += "\"region\":\"" + region + "\","; 
+    jsonResponse += "\"city\":\"" + city + "\","; 
+    jsonResponse += "\"isp\":\"" + isp + "\","; 
+    jsonResponse += "\"timezone\":\"" + timezone + "\","; 
+    jsonResponse += "\"latitude\":" + String(latitude) + ","; 
+    jsonResponse += "\"longitude\":" + String(longitude); 
+    jsonResponse += "}";
+
+    // Send JSON response to the client
+    server.send(200, "application/json", jsonResponse);
+  } else {
+    Serial.println("Failed to connect to API");
+    server.send(500, "text/plain", "Failed to connect to IP geolocation service");
+  }
+}
+
+String extractValue(String data, const String key, const String delimiter) {
+  int startIndex = data.indexOf(key) + key.length();
+  int endIndex = data.indexOf(delimiter, startIndex);
+  return data.substring(startIndex, endIndex);
+}
+
+void handle_NotFound() {
+  server.send(404, "text/plain", "Not found");
+}
+
+
+String SendHTML(bool buzzer, bool relay, float tilt) {
+  String ptr = "<!DOCTYPE html><html>\n";
+  ptr += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, user-scalable=no\">\n";
+  ptr += "<title>Bike Rental Monitor</title>\n";
+
+  // Styling for modern look
+  ptr += "<style>";
+  ptr += "html { font-family: 'Arial', sans-serif; background-color: #f0f4f8; color: #333; }";
+  ptr += "body { margin: 0; padding: 20px; text-align: center; }";
+  ptr += "h1 { color: #007BFF; margin-bottom: 20px; }";
+  ptr += ".card { background: #fff; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); padding: 20px; margin: 20px auto; max-width: 500px; }";
+  ptr += ".status-card { border-left: 5px solid; padding: 10px; transition: border-color 0.3s ease; }";
+  ptr += ".status-safe { border-color: #28a745; }"; // Green for safe
+  ptr += ".status-danger { border-color: #dc3545; }"; // Red for danger
+  ptr += ".button { display: inline-block; width: 140px; padding: 10px 20px; margin: 10px auto; border-radius: 25px; text-decoration: none; font-size: 16px; font-weight: bold; cursor: pointer; transition: background-color 0.3s ease; }";
+  ptr += ".button-on { background-color: #28a745; color: #fff; }";
+  ptr += ".button-off { background-color: #dc3545; color: #fff; }";
+  ptr += "#map { height: 300px; width: 100%; border-radius: 10px; margin-top: 20px; }";
+  ptr += ".location-info { margin-top: 20px; }";
+  ptr += "</style>\n";
+
+  // Leaflet CSS for map display
+  ptr += "<link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.3/leaflet.css\" />\n";
+  ptr += "<script src=\"https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.3/leaflet.js\"></script>\n";
+
+  ptr += "</head>\n<body>\n";
+
+  // Card for tilt and status info
+  ptr += "<div id='statusCard' class='card status-card'>\n";
+  ptr += "<h1>Bike Rental Status</h1>\n";
+  ptr += "<div class='status'><strong>Tilt Angle:</strong> <span id=\"tiltValue\">" + String(tilt) + "</span>°</div>\n";
+  ptr += "<div class='status'><strong>Buzzer Status:</strong> <span>" + String(buzzer ? "ON" : "OFF") + "</span></div>\n";
+  ptr += "<div class='status'><strong>Relay Status:</strong> <span>" + String(relay ? "ON" : "OFF") + "</span></div>\n";
+  ptr += "</div>\n";
+
+  // Buttons to control relay
+  ptr += "<a class=\"button " + String(relay ? "button-off" : "button-on") + "\" href=\"/relay" + String(relay ? "off" : "on") + "\">Relay " + String(relay ? "OFF" : "ON") + "</a>\n";
+
+  // Card for location details
+  ptr += "<div class='card location-info'>\n";
+  ptr += "<h2>Location Details</h2>\n";
+  ptr += "<p><strong>City:</strong> <span id=\"city\"></span></p>\n";
+  ptr += "<p><strong>Region:</strong> <span id=\"region\"></span></p>\n";
+  ptr += "<p><strong>Country:</strong> <span id=\"country\"></span></p>\n";
+  ptr += "<p><strong>ISP:</strong> <span id=\"isp\"></span></p>\n";
+  ptr += "<p><strong>Timezone:</strong> <span id=\"timezone\"></span></p>\n";
+  ptr += "<div id=\"map\"></div>\n";
+  ptr += "</div>\n";
+
+  // JavaScript for real-time updates and location fetch
+  ptr += "<script>\n";
+  ptr += "const TILT_THRESHOLD = 30.0;\n"; // Tilt threshold in degrees
+
+  ptr += "async function fetchTilt() {\n";
+  ptr += "  try {\n";
+  ptr += "    const response = await fetch('/tiltValue');\n";
+  ptr += "    const tilt = parseFloat(await response.text());\n";
+  ptr += "    document.getElementById('tiltValue').innerText = tilt.toFixed(2);\n";
+  ptr += "    updateStatusCard(tilt);\n";
+  ptr += "  } catch (error) {\n";
+  ptr += "    console.error('Error fetching tilt value:', error);\n";
+  ptr += "  }\n";
+  ptr += "}\n";
+
+  // Update the status card color based on tilt angle
+  ptr += "function updateStatusCard(tilt) {\n";
+  ptr += "  const statusCard = document.getElementById('statusCard');\n";
+  ptr += "  if (Math.abs(tilt) > TILT_THRESHOLD) {\n";
+  ptr += "    statusCard.classList.remove('status-safe');\n";
+  ptr += "    statusCard.classList.add('status-danger');\n";
+  ptr += "  } else {\n";
+  ptr += "    statusCard.classList.remove('status-danger');\n";
+  ptr += "    statusCard.classList.add('status-safe');\n";
+  ptr += "  }\n";
+  ptr += "}\n";
+
+  ptr += "async function fetchLocation() {\n";
+  ptr += "  try {\n";
+  ptr += "    const response = await fetch('/location');\n";
+  ptr += "    const data = await response.json();\n";
+  ptr += "    document.getElementById('city').innerText = data.city;\n";
+  ptr += "    document.getElementById('region').innerText = data.region;\n";
+  ptr += "    document.getElementById('country').innerText = data.country;\n";
+  ptr += "    document.getElementById('isp').innerText = data.isp;\n";
+  ptr += "    document.getElementById('timezone').innerText = data.timezone;\n";
+  ptr += "    initMap(data.latitude, data.longitude);\n";
+  ptr += "  } catch (error) {\n";
+  ptr += "    console.error('Error fetching location:', error);\n";
+  ptr += "  }\n";
+  ptr += "}\n";
+
+  // Initialize map
+  ptr += "function initMap(lat, lon) {\n";
+  ptr += "  const map = L.map('map').setView([lat, lon], 15);\n";
+  ptr += "  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap contributors' }).addTo(map);\n";
+  ptr += "  L.marker([lat, lon]).addTo(map).bindPopup('Current Location: ' + lat.toFixed(4) + ', ' + lon.toFixed(4)).openPopup();\n";
+  ptr += "}\n";
+
+  ptr += "window.onload = () => { fetchLocation(); setInterval(fetchTilt, 2000); };\n";
+  ptr += "</script>\n";
+  ptr += "</body></html>\n";
+
+  return ptr;
+}
